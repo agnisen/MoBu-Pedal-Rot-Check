@@ -1,0 +1,239 @@
+"""
+MotionBuilder Python Script: Pedal Rotation Checker
+Checks all takes for pedals facing downward or having 360-degree flips
+"""
+
+import pyfbsdk
+import math
+
+def get_component_by_name(name):
+    """
+    Find component by name in the scene.
+
+    Args:
+        name (str): The name of the component to find.
+
+    Returns:
+        pyfbsdk.FBComponent or None: The component if found, otherwise None.
+    """
+    for component in pyfbsdk.FBSystem().Scene.Components:
+        if component.Name == name:
+            return component
+    return None
+
+def get_rotation_vector(component, frame_time):
+    """
+    Get the WORLD rotation vector for a component at a specific frame.
+
+    This function temporarily sets the scene time to the specified frame,
+    gets the WORLD rotation values, and then restores the original time.
+
+    Args:
+        component (pyfbsdk.FBComponent): The component to inspect.
+        frame_time (pyfbsdk.FBTime): The time at which to get the rotation.
+
+    Returns:
+        pyfbsdk.FBVector3d or None: The WORLD rotation vector if successful, otherwise None.
+    """
+    if not component:
+        return None
+    
+    # Get the system and player objects
+    system = pyfbsdk.FBSystem()
+    player = pyfbsdk.FBPlayerControl()
+    
+    # Store the original time to restore it later
+    current_time = system.LocalTime
+    
+    # Go to the specific frame to evaluate the rotation
+    player.Goto(frame_time)
+    
+    # Get the World Rotation vector. The Rotation property is for local rotation.
+    rotation_vector = pyfbsdk.FBVector3d()
+    # Using FBModelTransformationType based on user's sample code.
+    component.GetVector(rotation_vector, pyfbsdk.FBModelTransformationType.kModelRotation)
+    
+    # Restore original time
+    player.Goto(current_time)
+    
+    return rotation_vector
+
+def euler_to_z_axis(euler_rotation):
+    """
+    Convert Euler rotation to Z-axis direction vector.
+    This uses the rotation matrix for the default MotionBuilder rotation order (XYZ).
+
+    Args:
+        euler_rotation (tuple or pyfbsdk.FBVector3d): The Euler rotation in degrees.
+
+    Returns:
+        tuple: A tuple (z_x, z_y, z_z) representing the transformed Z-axis vector.
+    """
+    # Convert degrees to radians
+    rx = math.radians(euler_rotation[0])
+    ry = math.radians(euler_rotation[1])
+    rz = math.radians(euler_rotation[2])
+    
+    # Calculate sines and cosines for the rotation matrix
+    cos_x, sin_x = math.cos(rx), math.sin(rx)
+    cos_y, sin_y = math.cos(ry), math.sin(ry)
+    cos_z, sin_z = math.cos(rz), math.sin(rz)
+    
+    # Z-axis direction after rotation (third column of the XYZ rotation matrix)
+    z_x = cos_z * sin_y * cos_x + sin_z * sin_x
+    z_y = -sin_z * sin_y * cos_x + cos_z * sin_x
+    z_z = cos_y * cos_x
+    
+    return (z_x, z_y, z_z)
+
+def is_z_axis_downward(euler_rotation, threshold=-0.1):
+    """
+    Check if Z-axis is pointing downward.
+    This function uses the dot product with the world-up vector (0,0,-1)
+    by simply checking if the transformed Z-axis vector's z-component is negative.
+
+    Args:
+        euler_rotation (tuple or pyfbsdk.FBVector3d): The Euler rotation in degrees.
+        threshold (float): The dot product threshold. A negative value means
+                           the axis is pointing below the horizontal plane.
+
+    Returns:
+        bool: True if the Z-axis is pointing downward, False otherwise.
+    """
+    z_axis = euler_to_z_axis(euler_rotation)
+    # The z-component of the transformed vector directly corresponds to
+    # the dot product with the world's Z-down axis.
+    return z_axis[2] < threshold
+
+def detect_360_flip(prev_rotation, curr_rotation, flip_threshold=300.0):
+    """
+    Detect if there's a sudden 360-degree flip between frames.
+    This check looks for large, instantaneous changes in rotation values.
+
+    Args:
+        prev_rotation (tuple): The rotation from the previous frame.
+        curr_rotation (tuple): The rotation from the current frame.
+        flip_threshold (float): The degree difference to consider a flip.
+
+    Returns:
+        bool: True if a flip is detected, False otherwise.
+    """
+    if prev_rotation is None:
+        return False
+    
+    for i in range(3):  # Check X, Y, Z rotations
+        diff = abs(curr_rotation[i] - prev_rotation[i])
+        
+        # A true 360° flip will show a large difference in value, even if the
+        # visual change is minimal. We detect the large value difference directly.
+        if diff > flip_threshold:
+            return True
+    
+    return False
+
+def check_pedal_issues():
+    """Main function to check all takes for pedal issues"""
+    
+    # Get components
+    crank = get_component_by_name("crank")
+    pedal_l = get_component_by_name("pedal_l")
+    pedal_r = get_component_by_name("pedal_r")
+    
+    if not all([crank, pedal_l, pedal_r]):
+        print("ERROR: Could not find all components (crank, pedal_l, pedal_r)")
+        missing = []
+        if not crank: missing.append("crank")
+        if not pedal_l: missing.append("pedal_l")
+        if not pedal_r: missing.append("pedal_r")
+        print(f"Missing components: {', '.join(missing)}")
+        return
+    
+    # Get all takes
+    scene = pyfbsdk.FBSystem().Scene
+    takes = [scene.Takes[i] for i in range(len(scene.Takes))]
+    
+    if not takes:
+        print("No takes found in scene")
+        return
+    
+    print(f"Checking {len(takes)} takes for pedal issues...")
+    print("=" * 60)
+    
+    issues_found = False
+    
+    for take in takes:
+        print(f"\nChecking Take: {take.Name}")
+        
+        # Set current take
+        scene.CurrentTake = take
+        
+        # Get time span and create time stepping
+        time_span = take.LocalTimeSpan
+        start_time = time_span.GetStart()
+        stop_time = time_span.GetStop()
+        
+        current_time = start_time
+        
+        prev_pedal_l_rot = None
+        prev_pedal_r_rot = None
+        
+        take_issues = []
+        
+        # Loop through each frame
+        while current_time <= stop_time:
+            frame_number = current_time.GetFrame()
+            
+            # Get rotations for both pedals at current time
+            pedal_l_rot = get_rotation_vector(pedal_l, current_time)
+            pedal_r_rot = get_rotation_vector(pedal_r, current_time)
+            
+            if pedal_l_rot and pedal_r_rot:
+                # Convert to tuples for easier handling
+                l_rot = (pedal_l_rot[0], pedal_l_rot[1], pedal_l_rot[2])
+                r_rot = (pedal_r_rot[0], pedal_r_rot[1], pedal_r_rot[2])
+                
+                # Check for downward Z-axis
+                if is_z_axis_downward(l_rot):
+                    issue = f"Frame {frame_number}: pedal_l Z-axis pointing downward (rot: {l_rot[0]:.2f}, {l_rot[1]:.2f}, {l_rot[2]:.2f})"
+                    take_issues.append(issue)
+                
+                if is_z_axis_downward(r_rot):
+                    issue = f"Frame {frame_number}: pedal_r Z-axis pointing downward (rot: {r_rot[0]:.2f}, {r_rot[1]:.2f}, {r_rot[2]:.2f})"
+                    take_issues.append(issue)
+                
+                # Check for 360-degree flips
+                if detect_360_flip(prev_pedal_l_rot, l_rot):
+                    issue = f"Frame {frame_number}: pedal_l 360° flip detected"
+                    take_issues.append(issue)
+                
+                if detect_360_flip(prev_pedal_r_rot, r_rot):
+                    issue = f"Frame {frame_number}: pedal_r 360° flip detected"
+                    take_issues.append(issue)
+                
+                # Store previous rotations
+                prev_pedal_l_rot = l_rot
+                prev_pedal_r_rot = r_rot
+            
+            # Move to next frame
+            current_time.Set(current_time.Get() + pyfbsdk.FBTime(0,0,0,1).Get())
+        
+        # Report results for this take
+        if take_issues:
+            issues_found = True
+            print(f"  ISSUES FOUND ({len(take_issues)} total):")
+            for issue in take_issues:
+                print(f"    {issue}")
+        else:
+            print("  No issues found")
+    
+    print("\n" + "=" * 60)
+    if issues_found:
+        print("SUMMARY: Issues detected in one or more takes!")
+        print("Check the detailed output above for specific frames and components.")
+    else:
+        print("SUMMARY: No pedal rotation issues found in any take.")
+
+
+print("MotionBuilder Pedal Rotation Checker")
+print("Checking for downward Z-axis and 360° flips...")
+check_pedal_issues()
